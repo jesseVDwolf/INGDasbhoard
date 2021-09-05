@@ -1,211 +1,268 @@
-﻿import re
+import re
 import plotly
+import numpy as np
 import pandas as pd
-import altair as alt
 import streamlit as st
-from typing import Tuple
+from io import BytesIO
+import plotly.express as px
+from datetime import datetime
+from typing import Tuple, List
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from pandas.api.types import CategoricalDtype
 
 # Work around to store states across reruns
 import SessionState
 
 
-def preprocess_df(original: pd.DataFrame) -> pd.DataFrame:
-    """ modify the column names to something appropriate and make sure the right datatypes are used for the columns"""
-    new_df = original.copy()
-
-    chars = ['/', '(', ')']
-    new_df.columns = [''.join([c for c in col if c not in chars]) for col in new_df.columns]
-    new_df.columns = [re.sub(r' +', ' ', col).replace(' ', '_').lower() for col in new_df.columns]
-
-    new_df['date'] = pd.to_datetime(new_df['date'], format='%Y%m%d')
-    new_df['amount_eur'] = pd.to_numeric(new_df['amount_eur'].apply(lambda x: x.replace(',', '.')))
-    new_df['resulting_balance'] = pd.to_numeric(new_df['resulting_balance'].apply(lambda x: x.replace(',', '.')))
-    return new_df
-
-
-def get_line_chart_df(original: pd.DataFrame) -> pd.DataFrame:
-    """ convert the original dataframe to a dataframe usable for a line chart """
-    new_df = original.copy()
-
-    cols = ['date', 'debitcredit', 'amount_eur']
-    new_df = new_df.drop(columns=[col for col in new_df.columns if col not in cols])
+def bytes_to_df(file: BytesIO) -> pd.DataFrame:
+    """ create a cleaned up pandas dataframe from the streamlit BytesIO file """
+    df_raw = pd.read_csv(filepath_or_buffer=file, sep=';', decimal=',', dtype={
+        'Amount (EUR)': np.float64,
+        'Resulting Balance': np.float64
+    })
+    columns = df_raw.columns
+    columns = [re.sub(r"/|\(|\)", "", col) for col in columns]
+    columns = [re.sub(r" +", " ", col) for col in columns]
+    df_raw.columns = [col.replace(' ', '_').lower() for col in columns]
+    df_raw['date'] = pd.to_datetime(df_raw['date'], format='%Y%m%d')
+    df_raw['date_year'] = pd.DatetimeIndex(df_raw['date']).year
+    df_raw['date_month'] = pd.DatetimeIndex(df_raw['date']).month
+    df_raw['date_month_name'] = pd.DatetimeIndex(df_raw['date']).strftime("%B")
 
     # debitcredit column must be a categorical variable so that for each date
     # each category [Debit, Credit] is shown. This means that either one could
     # be zero if they didn't occur for a specific date, which is needed the chart
-    new_df.debitcredit = new_df.debitcredit.astype(CategoricalDtype(categories=new_df.debitcredit.unique()))
-    new_df = new_df.groupby(by=['date', 'debitcredit']).sum().reset_index()
-
-    # make sure the dataframe is oriented properly
-    # [date         creditdebit         amount_eur]
-    # 2021-01-01    credit              5
-    # 2021-01-01    debit               10
-    #
-    # to
-    #
-    # [date         debit               credit]
-    # 2021-01-01    10                  5
-    new_df = new_df.pivot(index='date', columns='debitcredit', values='amount_eur').reset_index()
-    new_df = new_df.set_index('date')
-    return new_df
+    df_raw['debitcredit'] = df_raw.debitcredit.astype(CategoricalDtype(categories=df_raw.debitcredit.unique()))
+    return df_raw.copy(deep=True)
 
 
-def get_debitcredit_groupby(original: pd.DataFrame, aggr_col: str) -> pd.DataFrame:
-    """ convert the original dataframe to a datafrmae useable for a pie chart """
-    new_df = original.copy()
-
-    cols = [aggr_col, 'debitcredit', 'amount_eur']
-    new_df = new_df.drop(columns=[col for col in new_df.columns if col not in cols])
-
-    # debitcredit column must be a categorical variable so that for each date
-    # each category [Debit, Credit] is shown. This means that either one could
-    # be zero if they didn't occur for a specific date, which is needed the chart
-    new_df.debitcredit = new_df.debitcredit.astype(CategoricalDtype(categories=new_df.debitcredit.unique()))
-    new_df = new_df.groupby(by=[aggr_col, 'debitcredit']).sum().reset_index()
-    return new_df
+def get_filter_options_years(export_df: pd.DataFrame) -> List[int]:
+    """ return filter options for years """
+    years = list(set(pd.DatetimeIndex(export_df['date']).year))
+    years.sort(reverse=True)
+    return years
 
 
-def split_pie_chart_df(original: pd.DataFrame, aggr_col: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """ split the original dataframe up into credit and debit dataframes """
-    new_df = original.copy()
+def get_filter_options_types(export_df: pd.DataFrame, state) -> Tuple[List[str], List[str]]:
+    """ return filter options for credit_types and debit_types based on current filters set by user """
+    df = export_df.copy(deep=True)
 
-    new_df = get_debitcredit_groupby(new_df, aggr_col)
-    mask = new_df['debitcredit'].isin(['Debit'])
-    new_df_debit = new_df[mask]
-    new_df_credit = new_df[~mask]
-    return new_df_debit, new_df_credit
+    # filter out transactions from years and months that are not selected by the user.
+    _years = [int(year) for year in state.year_filter]
+    df = df[df['date_year'].isin(_years) & df['date_month_name'].isin(state.month_filter)]
+
+    df_credit = df[df['debitcredit'] == 'Credit']
+    credit_types = list(set(df_credit.name_description.unique()))
+    df_debit = df[df['debitcredit'] == 'Debit']
+    debit_types = list(set(df_debit.name_description.unique()))
+    return credit_types, debit_types
 
 
-def get_pie_plotly_fig(credit: pd.DataFrame, debit: pd.DataFrame, aggr_col: str) -> plotly.graph_objs.Figure:
-    """ create pie subplots using plotly """
-    fig = make_subplots(rows=1, cols=2, specs=[[{'type': 'domain'}, {'type': 'domain'}]])
-    fig.add_trace(go.Pie(labels=debit[aggr_col], values=debit.amount_eur, hole=0.3, name=f'Debit'), 1, 1)
-    fig.add_trace(go.Pie(labels=credit[aggr_col], values=credit.amount_eur, hole=0.3, name=f'Credit'), 1, 2)
+def get_filter_options_month(export_df: pd.DataFrame, years: List[int]) -> List[int]:
+    """ get the month filter based on the current year filter """
+    df = export_df.copy(deep=True)
+
+    # filter out transactions from years that are not selected by the user.
+    _years = [int(year) for year in years]
+    df = df[df['date_year'].isin(_years)]
+
+    # we want full month names ["Januari", "Februari" ...] but we also want it sorted correctly
+    # 1. create a dataframe with only unique month name and corresponding month number
+    # 2. convert to list of tuples
+    # 3. let sorted() sort it ascending
+    # 4. remove the month number
+    df_month = df[['date_month', 'date_month_name']]
+    df_month = df_month.drop_duplicates()
+    months = list(df_month.itertuples(index=False, name=None))
+    months = sorted(months, reverse=False)
+    return [m for _, m in months]
+
+
+def get_plotly_pie_fig(df: pd.DataFrame, title: str, inside_text: str) -> plotly.graph_objs.Figure:
+    """ build a plotly pie figure with variable title and text in the hole """
+    fig = px.pie(data_frame=df,
+                 title=title + ': ' + str(round(df.amount_eur.sum(), 2)),
+                 values='amount_eur',
+                 names='name_description',
+                 color_discrete_sequence=px.colors.sequential.Burg)
+    fig.update_traces(
+        textposition='inside',
+        hoverinfo='label+percent+value',
+        textinfo='percent',
+        hole=0.2,
+        marker=dict(
+            colors=['honeydew'],
+            line=dict(
+                color='#000000',
+                width=1.2
+            )
+        )
+    )
     fig.update_layout(
-        # Add annotations in the center of the donut pies.
-        annotations=[dict(text='Debit', x=0.17, y=0.5, font_size=15, showarrow=False),
-                     dict(text='Credit', x=0.83, y=0.5, font_size=15, showarrow=False)])
+        uniformtext_minsize=6,
+        uniformtext_mode='hide',
+        annotations=[
+            dict(
+                text=inside_text,
+                x=0.5,
+                y=0.5,
+                showarrow=False,
+                font=dict(
+                    color='black',
+                    size=18
+                )
+            )
+        ],
+        legend=dict(
+            font=dict(
+                size=8,
+                color='black'
+            )
+        )
+    )
     return fig
 
 
-def aggregate_other(original: pd.DataFrame) -> pd.DataFrame:
-    """ find the top 10 and aggregate everything else to {other} """
-    trans_type = original.debitcredit.unique()[0]
-    top_ten = original.sort_values(by='amount_eur', ascending=False).head(10)['name_description'].unique()
-
-    df_other = original[~original['name_description'].isin(top_ten)]
-    df_other.loc[:, 'name_description'] = 'other'
-    df_other = df_other.groupby(['name_description', 'debitcredit']).sum().reset_index()
-    df_other = df_other[df_other['name_description'].isin([trans_type])]
-    return pd.concat([original[original['name_description'].isin(top_ten)], df_other])
+def get_plotly_bar_fig(df: pd.DataFrame) -> plotly.graph_objs.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=df.year_month.unique(),
+        y=df[df['debitcredit'] == 'Debit'].amount_eur,
+        name='Debit',
+        textposition='auto',
+        marker=dict(
+            color='rgb(246, 51, 102)',
+            line=dict(
+                color='#000000',
+                width=1.2
+            )
+        )
+    ))
+    fig.add_trace(go.Bar(
+        x=df.year_month.unique(),
+        y=df[df['debitcredit'] == 'Credit'].amount_eur,
+        name='Credit',
+        marker=dict(
+            color='lightpink',
+            line=dict(
+                color='#000000',
+                width=1.2
+            )
+        )
+    ))
+    fig.update_layout(
+        title='Spendings vs Gains per month',
+        xaxis_tickfont_size=14,
+        yaxis=dict(
+            title='Euros',
+            titlefont_size=16,
+            tickfont_size=14,
+        ),
+        legend=dict(
+            x=0,
+            y=1.0,
+            bgcolor='rgba(255, 255, 255, 0)',
+            bordercolor='rgba(255, 255, 255, 0)'
+        ),
+        barmode='group',
+        bargap=0.25,  # gap between bars of adjacent location coordinates.
+        bargroupgap=0.1  # gap between bars of the same location coordinate.
+    )
+    return fig
 
 
 def main():
-    # stream configuration
+    # streamlit config
     st.set_page_config(layout='wide')
 
     st.markdown("<h1 style='text-align: center;'>ING export dashboard</h1>", unsafe_allow_html=True)
-    state = SessionState.get(form_submitted=False)
+    filters = {'year_filter': None, 'month_filter': None, 'type_active_filter': False, 'credit_types_filter': None, 'debit_types_filter': None}
+    state = SessionState.get(form_submitted=False, export_df=None, **filters)
 
     if not state.form_submitted:
-        empty_one, form_col, empty_two = st.beta_columns([2, 1, 2])
+        empty_one, form_col, empty_two = st.columns([2, 1, 2])
         with form_col:
             form = st.form(key='my_form')
-            state.name = form.text_input(label="Name")
             state.ing_export = form.file_uploader('Upload ING transaction export', type=['.csv'])
             submit = form.form_submit_button(label="Submit")
             if submit:
                 state.form_submitted = True
 
     else:
-        style: str = f"<div style='text-align: center; font-family: \"Comic sans MS\"'>"
-        st.markdown(f"{style}📁 {state.ing_export.name}</div>", unsafe_allow_html=True)
-        st.markdown(f"{style}👤 {state.name}</div>", unsafe_allow_html=True)
+        if not isinstance(state.export_df, pd.DataFrame):
+            state.export_df = bytes_to_df(state.ing_export)
 
-        df: pd.DataFrame = pd.read_csv(state.ing_export, sep=';', quoting=True)
-        df: pd.DataFrame = preprocess_df(df)
+        try:
+            file_name = state.ing_export.name[:state.ing_export.name.find('.csv')]
+            _, _from, _to = file_name.split('_')
+            export_date_from, export_date_to = (datetime.strptime(v, '%d-%m-%Y').strftime("%a %b %d, %Y") for v in [_from, _to])
+        except ValueError:
+            export_date_from = export_date_to = "[Unknown]"
+        st.markdown(f"<div style='text-align: center;'>{export_date_from} <b> - </b> {export_date_to}</div>", unsafe_allow_html=True)
 
-        # OVERAL SPENDINGS
-        st.header("Overal spendings")
-        st.subheader("Both incoming and outgoing payments over time")
+        filter_container = st.container()
+        with filter_container:
+            st.markdown("<h2 style='text-align: center;'>Date and type filters</h2>", unsafe_allow_html=True)
+            expander = st.expander(label="", expanded=True)
+            with expander:
+                col_one_filter, col_two_filter = st.columns(2)
+                years = get_filter_options_years(export_df=state.export_df)
 
-        # line chart with date per day [2021-01-01 ... 2021-07-15]
-        bar_chart_overal = alt.Chart(df).mark_bar().encode(x='date:T', y='amount_eur:Q', color='debitcredit')
-        st.altair_chart(bar_chart_overal, use_container_width=True)
+                # year_filter must always contain a filter value otherwise month filter won't filter properly
+                state.year_filter = col_one_filter.multiselect("Filter on years", years, default=years)
 
-        # display pie charts in seperate columns
-        pie_month_col, pie_type_col = st.beta_columns(2)
-        pie_month_col.subheader("Transactions per month")
-        pie_type_col.subheader("Transactions per type")
+                months = get_filter_options_month(export_df=state.export_df, years=state.year_filter)
+                state.month_filter = col_two_filter.multiselect("Filter on months", months, default=months)
 
-        # pie chart with amount per month [2021-01 ... 2021-07]
-        df_chart_pie = df.copy()
-        df_chart_pie['date'] = df_chart_pie['date'].apply(lambda x: x.strftime('%Y-%m'))
-        df_chart_pie_debit, df_chart_pie_credit = split_pie_chart_df(df_chart_pie, 'date')
-        fig = get_pie_plotly_fig(df_chart_pie_credit, df_chart_pie_debit, 'date')
-        pie_month_col.plotly_chart(fig)
+            expander = st.expander(label="", expanded=True)
+            with expander:
+                col_one_filter, col_two_filter = st.columns(2)
 
-        # get monthly averages from pie chart dataframe
-        avg_debit = df_chart_pie_debit.amount_eur.mean()
-        avg_credit = df_chart_pie_credit.amount_eur.mean()
+                # type filters
+                credit_types, debit_types = get_filter_options_types(export_df=state.export_df, state=state)
+                state.type_active_filter = col_one_filter.checkbox('use type filter', value=False)
+                state.credit_types_filter = col_two_filter.multiselect("Filter on credit types", credit_types)
+                state.debit_types_filter = col_two_filter.multiselect("Filter on debit types", debit_types)
 
-        # pie chart with amount per type [ALBERT HEIJN 1647 AMSTERDAM NLD ... TLS BV inz. OV-Chipkaart]
-        df_chart_pie = df.copy()
-        df_chart_pie_debit, df_chart_pie_credit = split_pie_chart_df(df_chart_pie, 'name_description')
-        df_chart_pie_debit = aggregate_other(df_chart_pie_debit)
-        df_chart_pie_credit = aggregate_other(df_chart_pie_credit)
-        fig = get_pie_plotly_fig(df_chart_pie_credit, df_chart_pie_debit, 'name_description')
-        pie_type_col.plotly_chart(fig)
+        summary_container = st.container()
+        with summary_container:
+            df_summary = state.export_df.copy(deep=True)
+            df_summary = df_summary[df_summary['date_year'].isin([int(y) for y in state.year_filter])]
+            df_summary = df_summary[df_summary['date_month_name'].isin(state.month_filter)]
+            if state.type_active_filter:
+                # filter out all types not specified by the type filters
+                df_summary = df_summary[
+                    (df_summary['name_description'].isin(state.credit_types_filter)) |
+                    (df_summary['name_description'].isin(state.debit_types_filter))
+                ]
+            df_summary['year_month'] = df_summary['date_month_name'] + ' ' + df_summary['date_year'].astype(str)
 
-        incoming_col, outgoing_col = st.beta_columns(2)
-        columns = ['date', 'debitcredit', 'name_description', 'amount_eur', 'notifications']
-        df_table = df.drop(columns=[col for col in df.columns if col not in columns])
-        df_table['date'] = df_table['date'].apply(lambda x: x.strftime('%Y-%m-%d'))
+            # create bar graph dataset and plotly bar object
+            cols = ['year_month', 'debitcredit', 'amount_eur']
+            df_summary_bar = df_summary.drop(columns=[col for col in df_summary.columns if col not in cols])
+            df_summary_bar = df_summary_bar.groupby(by=['year_month', 'debitcredit']).sum().reset_index()
+            st.plotly_chart(figure_or_data=get_plotly_bar_fig(
+                df=df_summary_bar
+            ), use_container_width=True)
 
-        # INCOMING
-        incoming_col.header(f"☝ Incoming -> On average per month: €{round(avg_credit, 2)}")
+            # create pie graph datasets
+            cols = ['year_month', 'debitcredit', 'amount_eur', 'name_description']
+            df_summary_pie = df_summary.drop(columns=[col for col in df_summary.columns if col not in cols])
+            df_summary_pie = df_summary_pie.groupby(by=['year_month', 'debitcredit', 'name_description']).sum().reset_index()
 
-        # Incoming per month on average
-        incoming_col.markdown("""
-        #### **top 10 biggest transactions in the file**  
-        ---
-        """)
-        incoming_col.write(df_table[df_table['debitcredit'].isin(['Credit'])].sort_values(
-            by='amount_eur',
-            ascending=False
-        ).reset_index(drop=True).head(10))
+            # plot the pie charts in the correct columns
+            col_one, col_two = st.columns(2)
+            col_one.plotly_chart(figure_or_data=get_plotly_pie_fig(
+                df=df_summary_pie[df_summary_pie['debitcredit'] == 'Debit'],
+                title='Total spend per type',
+                inside_text='Debit'
+            ), use_container_width=True)
 
-        incoming_col.markdown("""
-        #### **top 10 smallest transactions in the file**  
-        ---
-        """)
-        incoming_col.write(df_table[df_table['debitcredit'].isin(['Credit'])].sort_values(
-            by='amount_eur'
-        ).reset_index(drop=True).head(10))
-
-        # OUTGOING
-        outgoing_col.header(f"👇 Outgoing -> On average per month: €{round(avg_debit, 2)}")
-
-        outgoing_col.markdown("""
-        #### **top 10 biggest transactions in the file**  
-        ---
-        """)
-        outgoing_col.write(df_table[df_table['debitcredit'].isin(['Debit'])].sort_values(
-            by='amount_eur',
-            ascending=False
-        ).reset_index(drop=True).head(10))
-
-        # top 10 smallest transactions in the file
-        outgoing_col.markdown("""
-        #### **top 10 smallest transactions in the file**  
-        ---
-        """)
-        outgoing_col.write(df_table[df_table['debitcredit'].isin(['Debit'])].sort_values(
-            by='amount_eur'
-        ).reset_index(drop=True).head(10))
+            col_two.plotly_chart(figure_or_data=get_plotly_pie_fig(
+                df=df_summary_pie[df_summary_pie['debitcredit'] == 'Credit'],
+                title='Total gains per type',
+                inside_text='Credit'
+            ), use_container_width=True)
 
 
 if __name__ == '__main__':
