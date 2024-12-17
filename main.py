@@ -10,9 +10,6 @@ from typing import Tuple, List
 import plotly.graph_objects as go
 from pandas.api.types import CategoricalDtype
 
-# Work around to store states across reruns
-import SessionState
-
 
 def bytes_to_df(file: BytesIO) -> pd.DataFrame:
     """ create a cleaned up pandas dataframe from the streamlit BytesIO file """
@@ -177,23 +174,25 @@ def main():
 
     st.markdown("<h1 style='text-align: center;'>ING export dashboard</h1>", unsafe_allow_html=True)
     filters = {'year_filter': None, 'month_filter': None, 'type_active_filter': False, 'credit_types_filter': None, 'debit_types_filter': None}
-    state = SessionState.get(form_submitted=False, export_df=None, **filters)
 
-    if not state.form_submitted:
+    for (k, v) in dict(form_submitted=False, export_df=None, **filters).items():
+        st.session_state.setdefault(k, v)
+
+    if not st.session_state.form_submitted:
         empty_one, form_col, empty_two = st.columns([2, 1, 2])
         with form_col:
             form = st.form(key='my_form')
-            state.ing_export = form.file_uploader('Upload ING transaction export', type=['.csv'])
+            st.session_state.ing_export = form.file_uploader('Upload ING transaction export', type=['.csv'])
             submit = form.form_submit_button(label="Submit")
             if submit:
-                state.form_submitted = True
+                st.session_state.form_submitted = True
 
     else:
-        if not isinstance(state.export_df, pd.DataFrame):
-            state.export_df = bytes_to_df(state.ing_export)
+        if not isinstance(st.session_state.export_df, pd.DataFrame):
+            st.session_state.export_df = bytes_to_df(st.session_state.ing_export)
 
         try:
-            file_name = state.ing_export.name[:state.ing_export.name.find('.csv')]
+            file_name = st.session_state.ing_export.name[:st.session_state.ing_export.name.find('.csv')]
             _, _from, _to = file_name.split('_')
             export_date_from, export_date_to = (datetime.strptime(v, '%d-%m-%Y').strftime("%a %b %d, %Y") for v in [_from, _to])
         except ValueError:
@@ -206,34 +205,34 @@ def main():
             expander = st.expander(label="", expanded=True)
             with expander:
                 col_one_filter, col_two_filter = st.columns(2)
-                years = get_filter_options_years(export_df=state.export_df)
+                years = get_filter_options_years(export_df=st.session_state.export_df)
 
                 # year_filter must always contain a filter value otherwise month filter won't filter properly
-                state.year_filter = col_one_filter.multiselect("Filter on years", years, default=years)
+                st.session_state.year_filter = col_one_filter.multiselect("Filter on years", years, default=years)
 
-                months = get_filter_options_month(export_df=state.export_df, years=state.year_filter)
-                state.month_filter = col_two_filter.multiselect("Filter on months", months, default=months)
+                months = get_filter_options_month(export_df=st.session_state.export_df, years=st.session_state.year_filter)
+                st.session_state.month_filter = col_two_filter.multiselect("Filter on months", months, default=months)
 
             expander = st.expander(label="", expanded=True)
             with expander:
                 col_one_filter, col_two_filter = st.columns(2)
 
                 # type filters
-                credit_types, debit_types = get_filter_options_types(export_df=state.export_df, state=state)
-                state.type_active_filter = col_one_filter.checkbox('use type filter', value=False)
-                state.credit_types_filter = col_two_filter.multiselect("Filter on credit types", credit_types)
-                state.debit_types_filter = col_two_filter.multiselect("Filter on debit types", debit_types)
+                credit_types, debit_types = get_filter_options_types(export_df=st.session_state.export_df, state=st.session_state)
+                st.session_state.type_active_filter = col_one_filter.checkbox('use type filter', value=False)
+                st.session_state.credit_types_filter = col_two_filter.multiselect("Filter on credit types", credit_types)
+                st.session_state.debit_types_filter = col_two_filter.multiselect("Filter on debit types", debit_types)
 
         summary_container = st.container()
         with summary_container:
-            df_summary = state.export_df.copy(deep=True)
-            df_summary = df_summary[df_summary['date_year'].isin([int(y) for y in state.year_filter])]
-            df_summary = df_summary[df_summary['date_month_name'].isin(state.month_filter)]
-            if state.type_active_filter:
+            df_summary = st.session_state.export_df.copy(deep=True)
+            df_summary = df_summary[df_summary['date_year'].isin([int(y) for y in st.session_state.year_filter])]
+            df_summary = df_summary[df_summary['date_month_name'].isin(st.session_state.month_filter)]
+            if st.session_state.type_active_filter:
                 # filter out all types not specified by the type filters
                 df_summary = df_summary[
-                    (df_summary['name_description'].isin(state.credit_types_filter)) |
-                    (df_summary['name_description'].isin(state.debit_types_filter))
+                    (df_summary['name_description'].isin(st.session_state.credit_types_filter)) |
+                    (df_summary['name_description'].isin(st.session_state.debit_types_filter))
                 ]
             df_summary['year_month'] = df_summary['date_month_name'] + ' ' + df_summary['date_year'].astype(str)
 
